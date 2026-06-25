@@ -417,7 +417,7 @@ wait_for_nextcloud() {
     if grep -q 'installed: true' <<<"$status"; then ok "Nextcloud is up."; return 0; fi
     # Distinguish "still booting" from "up but not installed" for the log.
     if grep -q 'installed: false' <<<"$status"; then info "container up, finishing install..."; fi
-    sleep 5; ((t++)); printf '.'
+    sleep 5; t=$((t+1)); printf '.'
   done
   echo
   warn "Nextcloud not confirmed ready after $((max*5))s."
@@ -427,7 +427,7 @@ wait_for_es() {
   local t=0
   while (( t < 60 )); do
     dc exec -T nextcloud curl -fs http://elasticsearch:9200/_cluster/health >/dev/null 2>&1 && { ok "Elasticsearch ready."; return 0; }
-    sleep 5; ((t++))
+    sleep 5; t=$((t+1))
   done
   warn "Elasticsearch not ready in time; full-text config may fail."
 }
@@ -439,7 +439,7 @@ wait_for_healthy() { # wait_for_healthy SERVICE
       st="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo none)"
       [[ "$st" == "healthy" || "$st" == "none" ]] && { ok "$svc ready ($st)."; return 0; }
     fi
-    sleep 5; ((t++))
+    sleep 5; t=$((t+1))
   done
   warn "$svc not healthy in time — check './install.sh status'."
 }
