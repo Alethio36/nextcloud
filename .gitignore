@@ -1,0 +1,15 @@
+# Secrets and per-host config — NEVER commit these.
+.env
+components.env
+
+# Logs
+install.log
+
+# Local TLS state if anyone points data here by mistake
+letsencrypt/
+acme.json
+
+# Editor noise
+*.swp
+.DS_Store
+backups/

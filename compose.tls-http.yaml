@@ -1,0 +1,20 @@
+# HTTP-01 TLS override — layered by the script when TLS_MODE=http (no Cloudflare).
+# Compose REPLACES command lists in overrides (it does not merge them), so this
+# restates the FULL Traefik command, swapping Cloudflare DNS-01 for HTTP-01.
+# Requirement: TCP 80 must be reachable from the internet for cert issuance.
+# Works with ANY DNS provider — just point the A records at your WAN IP.
+services:
+  traefik:
+    command:
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --log.level=INFO
