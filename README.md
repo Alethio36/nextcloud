@@ -57,6 +57,7 @@ sudo ./install.sh install          # full guided install (alias: first-run)
 sudo ./install.sh reconfigure      # turn components on/off, apply the delta
 sudo ./install.sh validate         # smoke-test what's enabled
 sudo ./install.sh status           # services + enabled components
+sudo ./install.sh index            # rebuild the full-text search index
 sudo ./install.sh check-updates    # report newer image tags (best-effort)
 sudo ./install.sh update           # re-pin versions + recreate (backs up first)
 sudo ./install.sh backup           # pg_dump + tar to ./backups

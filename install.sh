@@ -45,7 +45,9 @@ else
   C_RESET=""; C_INFO=""; C_OK=""; C_WARN=""; C_ERR=""; C_STEP=""
 fi
 _log()  { printf '%s\n' "$*" | tee -a "$LOG_FILE" >/dev/null; }
-step()  { printf '%s\n' "${C_STEP}==> $*${C_RESET}"; _log "==> $*"; }
+step()  { printf '\n%s\n' "${C_STEP}━━ $* ━━${C_RESET}"; _log "== $*"; }
+substep(){ printf '%s\n' "${C_STEP}  $*${C_RESET}"; _log "  -- $*"; }
+note()  { printf '%s\n' "    $*"; _log "    $*"; }   # plain-language explanation
 info()  { printf '%s\n' "${C_INFO}  - $*${C_RESET}"; _log "  - $*"; }
 ok()    { printf '%s\n' "${C_OK}  ✓ $*${C_RESET}"; _log "  ok $*"; }
 warn()  { printf '%s\n' "${C_WARN}  ! $*${C_RESET}"; _log "  ! $*"; }
@@ -96,19 +98,33 @@ ensure_env() { # only set if currently empty/missing — the idempotency rule
 }
 
 # Prompt for a value only if it isn't already set (idempotent re-runs).
+# Silent when a value already exists, so re-runs aren't noisy.
 prompt_if_missing() { # KEY  "Prompt text"  [default]
   local key="$1" msg="$2" default="${3:-}"
-  [[ -n "$(get_env "$key")" ]] && { info "$key already set — keeping it."; return; }
+  [[ -n "$(get_env "$key")" ]] && return
   local input
-  if [[ -n "$default" ]]; then read -rp "  $msg [$default]: " input; input="${input:-$default}"
-  else read -rp "  $msg: " input; fi
+  if [[ -n "$default" ]]; then read -rp "    $msg [$default]: " input; input="${input:-$default}"
+  else read -rp "    $msg: " input; fi
   set_env "$key" "$input"
 }
 prompt_secret_if_missing() { # KEY  "Prompt text"  (hidden input)
   local key="$1" msg="$2" input
-  [[ -n "$(get_env "$key")" ]] && { info "$key already set — keeping it."; return; }
-  read -rsp "  $msg: " input; echo
+  [[ -n "$(get_env "$key")" ]] && return
+  read -rsp "    $msg: " input; echo
   set_env "$key" "$input"
+}
+
+# Copy the pinned image tags from versions.env INTO .env, so that a plain
+# `docker compose ...` (run by hand, outside this script) resolves them too.
+# Without this, bare compose runs with blank tags and can recreate containers
+# wrong — the root cause of a lot of confusing breakage.
+sync_versions_to_env() {
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[A-Z_]+= ]] || continue        # skip comments/blank lines
+    key="${line%%=*}"; val="${line#*=}"
+    set_env "$key" "$val"
+  done < "$VERSIONS_FILE"
 }
 
 # ── component manifest ───────────────────────────────────────────────────────
@@ -227,68 +243,87 @@ EOF
 
 prompt_config() {
   CURRENT_STEP="config"; step "Configuration"
+  note "I'll ask a few questions. Press Enter to accept the [default] in brackets."
+  note "On a re-run, anything already saved is kept — you won't be asked twice."
   [[ -f "$ENV_FILE" ]] || : > "$ENV_FILE"   # start with an EMPTY .env; prompts fill it
   load_components
 
-  # Project + paths
+  # Derived/internal values — set automatically, no prompts.
   ensure_env PROJECT_NAME "nextcloud"
   ensure_env TZ "$(cat /etc/timezone 2>/dev/null || echo Etc/UTC)"
   ensure_env NOTIFY_PUSH_ARCH "$(detect_arch)"
   ensure_env FRONTEND_SUBNET "172.20.0.0/24"
   ensure_env BACKEND_SUBNET  "172.21.0.0/24"
-  prompt_if_missing DATA_ROOT "Data directory (bind-mount storage, kept outside this clone)" "/opt/nextcloud-data"
 
-  # Domain + subdomains
+  substep "1) Where to store data"
+  note "Your files, database and config live here. It's kept OUTSIDE this folder"
+  note "so updating the code can never touch your data."
+  prompt_if_missing DATA_ROOT "Data directory" "/opt/nextcloud-data"
+
+  substep "2) Your domain"
+  note "Enter the root domain you own. The services live on subdomains under it"
+  note "(e.g. cloud.<domain>). Accept the suggested subdomains unless you have a reason not to."
   prompt_if_missing DOMAIN "Base domain (e.g. example.com)"
   local d; d="$(get_env DOMAIN)"
-  prompt_if_missing CLOUD_HOST   "Nextcloud hostname"   "cloud.$d"
-  prompt_if_missing OFFICE_HOST  "Collabora hostname"   "office.$d"
-  prompt_if_missing TRAEFIK_HOST "Traefik dashboard hostname" "traefik.$d"
-  prompt_if_missing SIGNAL_HOST  "Talk HPB hostname"    "signal.$d"
-  prompt_if_missing ACME_EMAIL   "Email for Let's Encrypt" "admin@$d"
-  prompt_if_missing MAIL_DOMAIN  "Mail 'from' domain"   "$d"
+  prompt_if_missing CLOUD_HOST   "Nextcloud address"          "cloud.$d"
+  prompt_if_missing OFFICE_HOST  "Collabora (Office) address" "office.$d"
+  prompt_if_missing TRAEFIK_HOST "Traefik dashboard address"  "traefik.$d"
+  prompt_if_missing SIGNAL_HOST  "Talk call-server address"   "signal.$d"
+  prompt_if_missing ACME_EMAIL   "Email for Let's Encrypt certificate notices" "admin@$d"
+  prompt_if_missing MAIL_DOMAIN  "Domain that outgoing mail comes from" "$d"
 
-  # TLS mode
+  substep "3) HTTPS certificates"
+  note "Certificates are issued automatically by Let's Encrypt. How that's verified"
+  note "depends on your DNS provider:"
+  note "  • Cloudflare  → uses an API token (no open ports needed to issue certs)"
+  note "  • Anything else → uses HTTP-01 (needs port 80 open to the internet)"
   if [[ -z "$(get_env TLS_MODE)" ]]; then
-    if confirm "  Are you using Cloudflare for DNS? (enables DNS-01 wildcard-friendly certs)"; then
+    if confirm "  Is your DNS hosted on Cloudflare?"; then
       set_env TLS_MODE "cloudflare"
-      prompt_secret_if_missing CF_DNS_API_TOKEN "Cloudflare API token (Zone:DNS:Edit on this zone)"
+      note "Create the token at: Cloudflare → My Profile → API Tokens →"
+      note "  'Edit zone DNS' template, scoped to this domain's zone."
+      prompt_secret_if_missing CF_DNS_API_TOKEN "Paste the Cloudflare API token"
     else
       set_env TLS_MODE "http"
-      info "Using HTTP-01 (port 80 must be reachable from the internet)."
+      note "Using HTTP-01. Make sure port 80 is reachable from the internet."
     fi
   fi
 
-  # Admin — password MUST be user-provided (never auto-generated).
-  prompt_if_missing NEXTCLOUD_ADMIN_USER "Nextcloud admin username" "admin"
+  substep "4) Nextcloud administrator"
+  note "This is the login you'll use to manage Nextcloud. You choose the password"
+  note "(it is never auto-generated)."
+  prompt_if_missing NEXTCLOUD_ADMIN_USER "Admin username" "admin"
   if [[ -z "$(get_env NEXTCLOUD_ADMIN_PASSWORD)" ]]; then
     local p1 p2
     while :; do
-      read -rsp "  Nextcloud admin password (you set this): " p1; echo
-      read -rsp "  Confirm admin password: " p2; echo
+      read -rsp "    Admin password: " p1; echo
+      read -rsp "    Confirm password: " p2; echo
       [[ -n "$p1" && "$p1" == "$p2" ]] && break
-      warn "Empty or mismatched — try again."
+      warn "Empty or didn't match — try again."
     done
     set_env NEXTCLOUD_ADMIN_PASSWORD "$p1"
   fi
 
-  # SMTP
+  substep "5) Outgoing email (SMTP)"
+  note "Used for password resets, share notices, etc. Get these from your mail"
+  note "provider. You can leave them and configure mail later in Nextcloud."
   prompt_if_missing SMTP_HOST "SMTP server host"
   prompt_if_missing SMTP_PORT "SMTP port" "587"
   prompt_if_missing SMTP_NAME "SMTP username / login"
   prompt_secret_if_missing SMTP_PASSWORD "SMTP password"
-  prompt_if_missing MAIL_FROM_ADDRESS "Mail 'from' local-part (before @)" "cloud"
+  prompt_if_missing MAIL_FROM_ADDRESS "'From' name before the @ (e.g. cloud)" "cloud"
 
-  # Service passwords: generate all, or be prompted per-secret.
-  step "Service passwords"
+  substep "6) Service passwords"
+  note "Internal passwords for the database, cache, and call server. Recommended:"
+  note "let the script generate strong random ones — you never need to type these."
   local gen_all=true
-  confirm "  Auto-generate all service passwords? (recommended)" && gen_all=true || gen_all=false
+  confirm "  Auto-generate all service passwords?" && gen_all=true || gen_all=false
   local key
   for key in POSTGRES_PASSWORD REDIS_PASSWORD COLLABORA_PASSWORD TURN_SECRET SIGNALING_SECRET INTERNAL_SECRET; do
-    [[ -n "$(get_env "$key")" ]] && { info "$key already set — keeping it."; continue; }
+    [[ -n "$(get_env "$key")" ]] && continue
     if $gen_all; then set_env "$key" "$(gen_secret)"
     else
-      local v; read -rsp "  $key (blank = auto-generate): " v; echo
+      local v; read -rsp "    $key (Enter = generate one): " v; echo
       [[ -z "$v" ]] && v="$(gen_secret)"
       set_env "$key" "$v"
     fi
@@ -297,13 +332,17 @@ prompt_config() {
   ensure_env POSTGRES_USER "nextcloud"
   ensure_env COLLABORA_USERNAME "admin"
 
-  # Traefik dashboard basic-auth — build htpasswd, double $ for Compose.
+  substep "7) Traefik dashboard login"
+  note "Protects the Traefik admin dashboard (username is 'admin')."
   if [[ -z "$(get_env TRAEFIK_DASHBOARD_AUTH)" ]]; then
     local dpw
-    read -rsp "  Traefik dashboard password (user 'admin'): " dpw; echo
+    read -rsp "    Dashboard password: " dpw; echo
     set_env TRAEFIK_DASHBOARD_AUTH "$(htpasswd -nbB admin "$dpw" | sed 's/[$]/$$/g')"
   fi
-  ok "Configuration written to .env"
+
+  # Make the chosen image versions visible to plain `docker compose` too.
+  sync_versions_to_env
+  ok "Configuration saved."
 }
 
 # ── filesystem ───────────────────────────────────────────────────────────────
@@ -327,36 +366,42 @@ setup_dirs() {
 
 # ── DNS instructions + manual gate ───────────────────────────────────────────
 show_dns_and_wait() {
-  CURRENT_STEP="dns"; step "DNS records required"
-  local tls cloud office traefik signal
+  CURRENT_STEP="dns"; step "DNS setup — do this now, before continuing"
+  local tls cloud office traefik signal pubip
   tls="$(get_env TLS_MODE)"; cloud="$(get_env CLOUD_HOST)"; office="$(get_env OFFICE_HOST)"
   traefik="$(get_env TRAEFIK_HOST)"; signal="$(get_env SIGNAL_HOST)"; load_components
-  echo "  Point these A records at this server's PUBLIC IP:"
-  echo "      $cloud"
-  echo "      $traefik"
-  [[ "${ENABLE_COLLABORA:-false}" == "true" ]] && echo "      $office"
-  [[ "${ENABLE_HPB:-false}"       == "true" ]] && echo "      $signal"
+  pubip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '<your public IP>')"
+  note "Create these DNS 'A' records, each pointing at your server's public IP."
+  note "Your public IP looks like: $pubip"
+  echo
+  echo "      $cloud      →  $pubip"
+  echo "      $traefik    →  $pubip"
+  [[ "${ENABLE_COLLABORA:-false}" == "true" ]] && echo "      $office     →  $pubip"
+  [[ "${ENABLE_HPB:-false}"       == "true" ]] && echo "      $signal     →  $pubip"
   echo
   if [[ "$tls" == "cloudflare" ]]; then
-    echo "  Cloudflare: set each record to DNS only (GREY cloud), not proxied."
-    echo "  Orange-cloud breaks WebSockets, large uploads, and TURN. DNS-01 uses"
-    echo "  your API token, so no inbound port is needed just to issue certs."
+    substep "Cloudflare users — important"
+    note "Set each record to 'DNS only' (GREY cloud), NOT proxied (orange cloud)."
+    note "The orange cloud breaks file uploads, calls, and live updates."
   else
-    echo "  HTTP-01 mode: TCP 80 MUST be reachable from the internet to issue"
-    echo "  certs. Any DNS provider works — just point the records at your WAN IP."
+    substep "HTTP-01 mode"
+    note "Make sure TCP port 80 is reachable from the internet — that's how the"
+    note "certificate gets verified. Any DNS provider is fine."
   fi
   echo
-  echo "  Router: forward TCP 80 and 443 to this host."
-  [[ "${ENABLE_HPB:-false}" == "true" ]] && echo "  Also forward TCP+UDP 3478 (Talk TURN)."
+  substep "On your router / firewall, forward to this server:"
+  note "TCP 80 and 443"
+  [[ "${ENABLE_HPB:-false}" == "true" ]] && note "TCP + UDP 3478  (needed for Talk calls)"
   echo
-  read -rp "  Press ENTER once the records exist and have propagated... " _
+  read -rp "  Press ENTER once you've created the records and they've propagated... " _
   if need_cmd dig; then
     local ip; ip="$(dig +short "$cloud" | grep -E '^[0-9.]+$' | tail -n1 || true)"
     if [[ -z "$ip" ]]; then
-      warn "$cloud does not resolve yet — certificate issuance will fail."
-      confirm "Continue anyway?" || die "Add DNS and re-run './install.sh install'."
+      warn "$cloud doesn't resolve yet. Certificates can't be issued until it does."
+      note "(DNS can take a few minutes to propagate.)"
+      confirm "Continue anyway?" || die "Add the DNS records, then re-run: sudo ./install.sh install"
     else
-      ok "$cloud resolves to $ip"
+      ok "$cloud resolves to $ip — good."
     fi
   fi
 }
@@ -439,89 +484,128 @@ install_component_apps() {
 }
 occ_exec() { dc exec -T --user www-data nextcloud "$@"; }  # non-occ exec helper
 
-# Component config that needs the service running — all guarded/idempotent.
+# Component config that needs the service running.
+# Every occ call here is GUARDED — a transient (a service not ready yet, a
+# verify that can't reach the public URL) must never abort the whole install.
 configure_components() {
   CURRENT_STEP="component-config"; step "Configuring components"
+  note "Wiring up each enabled component. Warnings here are non-fatal — the"
+  note "install continues, and 'validate' will re-check everything at the end."
   load_components
   local cloud office signal
   cloud="$(get_env CLOUD_HOST)"; office="$(get_env OFFICE_HOST)"; signal="$(get_env SIGNAL_HOST)"
 
   if [[ "${ENABLE_COLLABORA:-false}" == "true" ]]; then
-    occ config:app:set richdocuments wopi_url --value "https://$office" >/dev/null
-    ok "Collabora WOPI URL set."
+    if occ config:app:set richdocuments wopi_url --value "https://$office" >/dev/null 2>&1; then
+      ok "Collabora connected (Office editing)."
+    else warn "Could not set the Collabora address — re-run 'reconfigure' later."; fi
   fi
 
   if [[ "${ENABLE_HPB:-false}" == "true" ]]; then
     wait_for_healthy talk
     local url="https://$signal/standalone-signaling" secret; secret="$(get_env SIGNALING_SECRET)"
     if occ talk:signaling:list 2>/dev/null | grep -qF "$url"; then
-      info "Signaling server already registered."
+      ok "Talk call server already registered."
+    elif occ talk:signaling:add "$url" "$secret" --verify >/dev/null 2>&1; then
+      ok "Talk call server registered and verified."
     else
-      occ talk:signaling:add "$url" "$secret" --verify
-      ok "Talk HPB registered."
+      # --verify failed (the public signal address may not be reachable yet).
+      # Register without verify so install completes; validate confirms it later.
+      if occ talk:signaling:add "$url" "$secret" >/dev/null 2>&1; then
+        warn "Talk call server registered, but couldn't be verified yet."
+        note "This is normal if DNS/cert for $signal isn't live yet."
+        note "Run 'sudo ./install.sh validate' once it's reachable."
+      else
+        warn "Talk call server registration failed — check the $signal route."
+      fi
     fi
   fi
 
   if [[ "${ENABLE_FULLTEXT:-false}" == "true" ]]; then
     wait_for_es
-    occ config:app:set fulltextsearch search_platform --value 'OCA\FullTextSearch_Elasticsearch\Platform\ElasticSearchPlatform' >/dev/null
-    occ config:app:set fulltextsearch_elasticsearch elastic_host --value 'http://elasticsearch:9200' >/dev/null
-    occ config:app:set fulltextsearch_elasticsearch elastic_index --value nextcloud >/dev/null
+    occ config:app:set fulltextsearch search_platform --value 'OCA\FullTextSearch_Elasticsearch\Platform\ElasticSearchPlatform' >/dev/null 2>&1 || true
+    occ config:app:set fulltextsearch_elasticsearch elastic_host  --value 'http://elasticsearch:9200' >/dev/null 2>&1 || true
+    occ config:app:set fulltextsearch_elasticsearch elastic_index --value nextcloud >/dev/null 2>&1 || true
     if occ fulltextsearch:test >/dev/null 2>&1; then
-      occ fulltextsearch:index >/dev/null 2>&1 || warn "Initial index run hit an issue; re-run later."
-      ok "Full-text search configured + indexed."
+      # Build the search index (creates the 'nextcloud' index). Guarded so a
+      # slow/large index can't abort the run; it can be re-run any time.
+      if occ fulltextsearch:index >/dev/null 2>&1; then ok "Search indexed."
+      else warn "Search configured, but indexing didn't finish."
+           note "Re-run later: sudo ./install.sh index"; fi
     else
-      warn "fulltextsearch:test failed — check Elasticsearch."
+      warn "Search engine not reachable yet — run 'reconfigure' once it's up."
     fi
   fi
 
   if [[ "${ENABLE_ANTIVIRUS:-false}" == "true" ]]; then
-    occ config:app:set files_antivirus av_mode --value daemon >/dev/null
-    occ config:app:set files_antivirus av_host --value clamav >/dev/null
-    occ config:app:set files_antivirus av_port --value 3310 >/dev/null
-    ok "ClamAV (daemon mode) configured."
+    occ config:app:set files_antivirus av_mode --value daemon >/dev/null 2>&1 || true
+    occ config:app:set files_antivirus av_host --value clamav  >/dev/null 2>&1 || true
+    occ config:app:set files_antivirus av_port --value 3310    >/dev/null 2>&1 || true
+    ok "Antivirus connected (scanning on upload)."
+    note "(Any earlier 'clamscan not found' error is from before this step — ignore it.)"
   fi
 
   if [[ "${ENABLE_PUSH:-false}" == "true" ]]; then
     sleep 5
-    if occ notify_push:setup "https://$cloud/push"; then ok "Client Push configured."
-    else warn "notify_push:setup reported an issue — run './install.sh validate' after checking trusted proxies."; fi
+    if occ notify_push:setup "https://$cloud/push" >/dev/null 2>&1; then
+      ok "Live updates (Client Push) connected."
+    else
+      warn "Client Push setup didn't pass its self-test."
+      note "Run 'sudo ./install.sh validate' to see which check failed."
+    fi
   fi
 }
 
 print_summary() {
-  step "Done"
+  step "All done"
   local cloud; cloud="$(get_env CLOUD_HOST)"
   cat <<EOF
 
-  Nextcloud:        https://$cloud
-  Traefik board:    https://$(get_env TRAEFIK_HOST)  (user 'admin')
-  Admin user:       $(get_env NEXTCLOUD_ADMIN_USER)
-  Data root:        $(get_env DATA_ROOT)
-  TLS mode:         $(get_env TLS_MODE)
+  Your Nextcloud is ready:
 
-  Next:
-    • First load may take a moment while certs issue.
-    • Run  ./install.sh validate  to smoke-test enabled components.
-    • Manual checks: a 3-way Talk call, an OFF-LAN participant (real TURN
-      test), and an SMTP send from Settings → Administration → Basic settings.
+    Open it at:        https://$cloud
+    Log in as:         $(get_env NEXTCLOUD_ADMIN_USER)  (the password you chose)
+    Traefik dashboard: https://$(get_env TRAEFIK_HOST)   (user 'admin')
+    Data is stored in: $(get_env DATA_ROOT)
+
+  A few things to know:
+    • The very first visit may take a few seconds while the HTTPS
+      certificate is issued — that's normal.
+    • Check everything is healthy:   sudo ./install.sh validate
+    • See what's running:            sudo ./install.sh status
+    • Add/remove features later:     sudo ./install.sh reconfigure
+
+  Worth testing by hand (nothing automated can):
+    • A Talk call with 3+ people, ideally one person off your network.
+    • Sending a test email from Settings → Administration → Basic settings.
+
 EOF
 }
 
 # ── subcommands ──────────────────────────────────────────────────────────────
 cmd_install() {
+  cat <<'EOF'
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Nextcloud stack installer                                  │
+  │  I'll set up Docker, ask a few questions, then build and    │
+  │  configure everything. Safe to re-run if anything stops.    │
+  └─────────────────────────────────────────────────────────────┘
+EOF
   preflight
   install_dependencies
   prompt_components
   prompt_config
+  sync_versions_to_env          # ensure plain `docker compose` also sees image tags
   setup_dirs
   show_dns_and_wait
-  CURRENT_STEP="up-core"; step "Starting core services (Traefik, DB, Redis, Nextcloud, cron)"
+  CURRENT_STEP="up-core"; step "Starting the core services"
+  note "Web server, database, cache, and Nextcloud itself."
   dc up -d traefik postgres redis nextcloud cron
   wait_for_nextcloud
   occ_base_config
   install_component_apps
-  CURRENT_STEP="up-optional"; step "Starting optional services"
+  CURRENT_STEP="up-optional"; step "Starting the optional services you chose"
   dc up -d
   configure_components
   print_summary
@@ -529,14 +613,22 @@ cmd_install() {
 
 cmd_reconfigure() {
   preflight
-  [[ -f "$ENV_FILE" ]] || die "No .env found — run './install.sh install' first."
+  [[ -f "$ENV_FILE" ]] || die "No setup found yet — run 'sudo ./install.sh install' first."
   prompt_components
+  sync_versions_to_env
   setup_dirs
   install_component_apps
-  step "Applying component changes"
+  step "Applying your changes"
   dc up -d --remove-orphans
   configure_components
-  ok "Reconfigure complete. Disabled components were stopped (data preserved)."
+  ok "Done. Components you turned off were stopped; their data is kept."
+}
+
+cmd_index() {
+  [[ -f "$ENV_FILE" ]] || die "No setup found yet."
+  step "Rebuilding the search index"
+  note "This creates/populates the search index. Can take a while with many files."
+  occ fulltextsearch:index && ok "Search index rebuilt." || warn "Indexing reported an issue — check Elasticsearch is up."
 }
 
 cmd_validate() {
@@ -636,6 +728,7 @@ cmd_update() {
     awk -v k="$var" -v v="${NEW[$var]}" 'BEGIN{FS=OFS="="} $1==k{print k,v; next}{print}' "$VERSIONS_FILE" > "$tmp"
     mv "$tmp" "$VERSIONS_FILE"
   done
+  sync_versions_to_env          # keep .env's copy of the tags in step
   step "Recreating containers"
   dc pull
   dc up -d --remove-orphans
@@ -675,14 +768,15 @@ Nextcloud stack manager
   sudo ./install.sh <command>
 
 Commands:
-  install | first-run   Full guided install
-  reconfigure           Toggle components on/off and apply
-  validate              Smoke-test enabled components
-  status                Show services + enabled components
-  check-updates         Report newer image tags (best-effort)
-  update [--allow-major]  Re-pin versions + recreate (backs up first)
-  backup                pg_dump + tar to ./backups
-  teardown [--volumes]  Stop the stack (optionally wipe the named volume)
+  install | first-run    Guided first-time install (safe to re-run)
+  reconfigure            Turn components on/off and apply
+  validate               Check that everything's working
+  status                 Show what's running + which components are on
+  index                  Rebuild the full-text search index
+  backup                 Back up the database + data to ./backups
+  check-updates          See if newer image versions exist (best-effort)
+  update [--allow-major] Update image versions (backs up first)
+  teardown [--volumes]   Stop the stack (--volumes also deletes the named volume)
 EOF
 }
 
@@ -693,6 +787,7 @@ case "$CMD" in
   reconfigure)       cmd_reconfigure "$@" ;;
   validate)          cmd_validate "$@" ;;
   status)            cmd_status "$@" ;;
+  index)             cmd_index "$@" ;;
   check-updates)     cmd_check_updates "$@" ;;
   update)            cmd_update "$@" ;;
   backup)            cmd_backup "$@" ;;
