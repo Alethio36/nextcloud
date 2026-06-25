@@ -364,12 +364,19 @@ show_dns_and_wait() {
 # ── orchestration ────────────────────────────────────────────────────────────
 wait_for_nextcloud() {
   CURRENT_STEP="wait-nextcloud"; step "Waiting for Nextcloud to initialize"
-  local t=0
-  while (( t < 90 )); do
-    if occ status 2>/dev/null | grep -q 'installed: true'; then ok "Nextcloud is up."; return 0; fi
+  local t=0 max=120 status
+  while (( t < max )); do
+    # occ status exits non-zero AND prints nothing useful while the entrypoint
+    # is still doing first-run setup; tolerate that and keep waiting.
+    status="$(occ status 2>/dev/null || true)"
+    if grep -q 'installed: true' <<<"$status"; then ok "Nextcloud is up."; return 0; fi
+    # Distinguish "still booting" from "up but not installed" for the log.
+    if grep -q 'installed: false' <<<"$status"; then info "container up, finishing install..."; fi
     sleep 5; ((t++)); printf '.'
   done
-  echo; die "Nextcloud did not finish initializing. Check: ./install.sh status"
+  echo
+  warn "Nextcloud not confirmed ready after $((max*5))s."
+  warn "If the next steps fail, check 'sudo ./install.sh status' and re-run install (it resumes safely)."
 }
 wait_for_es() {
   local t=0
