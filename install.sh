@@ -289,6 +289,21 @@ prompt_config() {
     fi
   fi
 
+  if [[ -z "$(get_env ACME_CASERVER)" ]]; then
+    note ""
+    note "Let's Encrypt limits you to 5 certs per domain per week. While testing"
+    note "(repeated installs), use the STAGING service — unlimited, but the certs"
+    note "aren't browser-trusted (you'll see a warning). Switch to production for"
+    note "the real, trusted cert once everything works."
+    if confirm "  Use Let's Encrypt STAGING certificates? (recommended only for testing)"; then
+      set_env ACME_CASERVER "https://acme-staging-v02.api.letsencrypt.org/directory"
+      note "Staging selected. To switch to real certificates later, run:"
+      note "    sudo ./install.sh cert-prod"
+    else
+      set_env ACME_CASERVER "https://acme-v02.api.letsencrypt.org/directory"
+    fi
+  fi
+
   substep "4) Nextcloud administrator"
   note "This is the login you'll use to manage Nextcloud. You choose the password"
   note "(it is never auto-generated)."
@@ -409,25 +424,18 @@ show_dns_and_wait() {
 # ── orchestration ────────────────────────────────────────────────────────────
 wait_for_nextcloud() {
   CURRENT_STEP="wait-nextcloud"; step "Waiting for Nextcloud to initialize"
-  local t=0 max=120 status
-  while (( t < max )); do
-    # occ status exits non-zero AND prints nothing useful while the entrypoint
-    # is still doing first-run setup; tolerate that and keep waiting.
-    status="$(occ status 2>/dev/null || true)"
-    if grep -q 'installed: true' <<<"$status"; then ok "Nextcloud is up."; return 0; fi
-    # Distinguish "still booting" from "up but not installed" for the log.
-    if grep -q 'installed: false' <<<"$status"; then info "container up, finishing install..."; fi
-    sleep 5; t=$((t+1)); printf '.'
+  local t=0
+  while (( t < 90 )); do
+    if occ status 2>/dev/null | grep -q 'installed: true'; then ok "Nextcloud is up."; return 0; fi
+    sleep 5; ((t++)); printf '.'
   done
-  echo
-  warn "Nextcloud not confirmed ready after $((max*5))s."
-  warn "If the next steps fail, check 'sudo ./install.sh status' and re-run install (it resumes safely)."
+  echo; die "Nextcloud did not finish initializing. Check: ./install.sh status"
 }
 wait_for_es() {
   local t=0
   while (( t < 60 )); do
     dc exec -T nextcloud curl -fs http://elasticsearch:9200/_cluster/health >/dev/null 2>&1 && { ok "Elasticsearch ready."; return 0; }
-    sleep 5; t=$((t+1))
+    sleep 5; ((t++))
   done
   warn "Elasticsearch not ready in time; full-text config may fail."
 }
@@ -439,7 +447,7 @@ wait_for_healthy() { # wait_for_healthy SERVICE
       st="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo none)"
       [[ "$st" == "healthy" || "$st" == "none" ]] && { ok "$svc ready ($st)."; return 0; }
     fi
-    sleep 5; t=$((t+1))
+    sleep 5; ((t++))
   done
   warn "$svc not healthy in time — check './install.sh status'."
 }
@@ -519,6 +527,21 @@ configure_components() {
         warn "Talk call server registration failed — check the $signal route."
       fi
     fi
+
+    # TURN/STUN: without this, calls connect and find peers but media (audio/
+    # video) never relays for anyone off-LAN — ICE fails. The aio-talk container
+    # runs eturnal (TURN) on 3478; clients must be told to use it, at the PUBLIC
+    # address, so UDP/TCP 3478 must be forwarded to this host.
+    local turn_addr="$signal:3478" turn_secret; turn_secret="$(get_env TURN_SECRET)"
+    if occ talk:turn:list 2>/dev/null | grep -qF "$turn_addr"; then
+      ok "Talk TURN server already registered."
+    elif occ talk:turn:add turn "$turn_addr" udp,tcp --secret "$turn_secret" >/dev/null 2>&1; then
+      ok "Talk TURN server registered."
+    else
+      warn "TURN registration failed — calls will connect but have no audio/video off-LAN."
+    fi
+    occ talk:stun:list 2>/dev/null | grep -qF "$turn_addr" \
+      || occ talk:stun:add "$turn_addr" >/dev/null 2>&1 || true
   fi
 
   if [[ "${ENABLE_FULLTEXT:-false}" == "true" ]]; then
@@ -631,6 +654,30 @@ cmd_index() {
   occ fulltextsearch:index && ok "Search index rebuilt." || warn "Indexing reported an issue — check Elasticsearch is up."
 }
 
+cmd_cert_prod() {
+  [[ -f "$ENV_FILE" ]] || die "No setup found yet."
+  step "Switching to production Let's Encrypt certificates"
+  local cur; cur="$(get_env ACME_CASERVER)"
+  if [[ "$cur" != *"acme-staging"* ]]; then
+    ok "Already on production certificates — nothing to do."
+    return 0
+  fi
+  note "This removes the staging certificates and re-issues real, browser-trusted"
+  note "ones from production. Production has a 5-cert-per-week limit, so only do"
+  note "this once you're confident everything works."
+  confirm "  Proceed?" || { note "Cancelled."; return 0; }
+  set_env ACME_CASERVER "https://acme-v02.api.letsencrypt.org/directory"
+  # Staging certs live in acme.json; Traefik keeps serving them unless cleared.
+  local acme; acme="$(get_env DATA_ROOT)/traefik/letsencrypt/acme.json"
+  if [[ -f "$acme" ]]; then
+    cp "$acme" "$acme.staging.bak" 2>/dev/null || true
+    : > "$acme"; chmod 600 "$acme"
+    note "Cleared staging certificates (backed up to acme.json.staging.bak)."
+  fi
+  dc up -d --force-recreate traefik
+  ok "Recreated Traefik. Real certificates will issue on first request (allow a moment)."
+}
+
 cmd_validate() {
   [[ -f "$ENV_FILE" ]] || die "No .env found."
   load_components
@@ -662,6 +709,91 @@ cmd_status() {
   printf '  Collabora=%s  HPB=%s  FullText=%s  Antivirus=%s  Push=%s\n' \
     "${ENABLE_COLLABORA:-false}" "${ENABLE_HPB:-false}" "${ENABLE_FULLTEXT:-false}" \
     "${ENABLE_ANTIVIRUS:-false}" "${ENABLE_PUSH:-false}"
+}
+
+# External storage management (S3-compatible). Pure occ — no compose changes, no
+# image rebuild, fully reversible. NFS/SMB are intentionally NOT here: a "Local"
+# (NFS) mount needs the host path bind-mounted into the container, and SMB needs
+# smbclient baked into a custom image. Both are documented in the README instead.
+cmd_storage() {
+  [[ -f "$ENV_FILE" ]] || die "No setup found yet — run 'sudo ./install.sh install' first."
+  occ app:enable files_external >/dev/null 2>&1 || true
+  local action="${1:-add}"
+  case "$action" in
+    list)
+      step "External storage mounts"
+      occ files_external:list || warn "Could not list mounts."
+      ;;
+    remove|delete)
+      step "Remove an external storage mount"
+      occ files_external:list || true
+      local mid
+      read -rp "    Mount ID to remove (from the list above): " mid
+      [[ -n "$mid" ]] || { note "Nothing entered — cancelled."; return 0; }
+      confirm "  Delete mount $mid? (the remote data itself is NOT touched)" || { note "Cancelled."; return 0; }
+      if occ files_external:delete --yes "$mid" >/dev/null 2>&1; then ok "Mount $mid removed."
+      else warn "Could not remove mount $mid — check the ID."; fi
+      ;;
+    add)
+      _storage_add_s3
+      ;;
+    *)
+      note "Usage: sudo ./install.sh storage [add|list|remove]"
+      ;;
+  esac
+}
+
+# Guided add of an S3-compatible bucket as external storage.
+_storage_add_s3() {
+  step "Add S3-compatible storage"
+  note "Works with AWS S3, MinIO, Wasabi, Backblaze B2 (S3 API), Ceph, TrueNAS S3,"
+  note "etc. The bucket can already exist or be created if your keys allow it."
+  echo
+  local name bucket host port region ssl pathstyle key secret
+  read -rp "    Folder name to show in Nextcloud (e.g. S3 Archive): " name
+  read -rp "    Bucket name: " bucket
+  read -rp "    Endpoint hostname (e.g. s3.amazonaws.com, minio.example.com): " host
+  read -rp "    Port [443]: " port; port="${port:-443}"
+  read -rp "    Region [us-east-1]: " region; region="${region:-us-east-1}"
+  if confirm "  Use HTTPS (SSL)?"; then ssl=true; else ssl=false; fi
+  # Path-style (https://host/bucket) suits MinIO/self-hosted; AWS also accepts it.
+  if confirm "  Use path-style URLs? (recommended for self-hosted like MinIO)"; then pathstyle=true; else pathstyle=false; fi
+  read -rp "    Access key: " key
+  read -rsp "    Secret key: " secret; echo
+  [[ -n "$name" && -n "$bucket" && -n "$host" && -n "$key" && -n "$secret" ]] \
+    || { warn "Name, bucket, hostname, key and secret are all required — cancelled."; return 0; }
+
+  local out mid
+  out="$(occ files_external:create "$name" amazons3 amazons3::accesskey \
+        -c bucket="$bucket" -c hostname="$host" -c port="$port" -c region="$region" \
+        -c use_ssl="$ssl" -c use_path_style="$pathstyle" \
+        -c key="$key" -c secret="$secret" 2>&1)" || { warn "Create failed:"; note "$out"; return 0; }
+  mid="$(printf '%s' "$out" | grep -oE '[0-9]+' | tail -n1)"
+  [[ -n "$mid" ]] && ok "Created mount #$mid ($name)." || { warn "Created, but couldn't read the mount ID:"; note "$out"; }
+
+  # Scope: all users (default), or restrict to one user/group.
+  if [[ -n "$mid" ]] && ! confirm "  Make available to ALL users?"; then
+    local who target
+    read -rp "    Restrict to (u)ser or (g)roup? [u/g]: " who
+    read -rp "    Name of that user/group: " target
+    if [[ -n "$target" ]]; then
+      occ files_external:applicable "$mid" --remove-all >/dev/null 2>&1 || true
+      if [[ "$who" == "g" ]]; then occ files_external:applicable "$mid" --add-group "$target" >/dev/null 2>&1
+      else occ files_external:applicable "$mid" --add-user "$target" >/dev/null 2>&1; fi \
+        && ok "Restricted to $target." || warn "Could not set scope — left available to all."
+    fi
+  fi
+
+  # Connectivity check.
+  if [[ -n "$mid" ]]; then
+    if occ files_external:verify "$mid" 2>/dev/null | grep -qi 'status: ok'; then
+      ok "Verified — Nextcloud can reach the bucket."
+    else
+      warn "Mount added but verification didn't return OK."
+      note "Check the endpoint, keys, SSL and path-style settings, then:"
+      note "    sudo ./install.sh storage list"
+    fi
+  fi
 }
 
 # Best-effort registry poll. Honest about what it can't check.
@@ -773,6 +905,8 @@ Commands:
   validate               Check that everything's working
   status                 Show what's running + which components are on
   index                  Rebuild the full-text search index
+  cert-prod              Switch from staging to production Let's Encrypt certs
+  storage [add|list|remove]  Manage S3-compatible external storage
   backup                 Back up the database + data to ./backups
   check-updates          See if newer image versions exist (best-effort)
   update [--allow-major] Update image versions (backs up first)
@@ -788,6 +922,8 @@ case "$CMD" in
   validate)          cmd_validate "$@" ;;
   status)            cmd_status "$@" ;;
   index)             cmd_index "$@" ;;
+  cert-prod)         cmd_cert_prod "$@" ;;
+  storage)           cmd_storage "$@" ;;
   check-updates)     cmd_check_updates "$@" ;;
   update)            cmd_update "$@" ;;
   backup)            cmd_backup "$@" ;;

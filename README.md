@@ -48,6 +48,10 @@ Two modes, chosen during install:
 
 The installer prints the exact A records to create (only for the components you enabled) and pauses until you confirm they resolve.
 
+**Staging vs production certificates.** Let's Encrypt limits you to 5 certs per domain per week. The installer offers a **staging** option for testing (unlimited issuance, but certs aren't browser-trusted). Pick staging while you iterate, then switch to real certs with `sudo ./install.sh cert-prod` once everything works.
+
+**All hosts must resolve to the same WAN IP** where you forward 80/443 (and 3478 for Talk). If `cloud.` and `signal.` point at different IPs, Talk media (TURN) fails even when calls connect — clients reach the wrong address for relay.
+
 ---
 
 ## Commands
@@ -58,6 +62,7 @@ sudo ./install.sh reconfigure      # turn components on/off, apply the delta
 sudo ./install.sh validate         # smoke-test what's enabled
 sudo ./install.sh status           # services + enabled components
 sudo ./install.sh index            # rebuild the full-text search index
+sudo ./install.sh cert-prod        # switch staging certs to production
 sudo ./install.sh check-updates    # report newer image tags (best-effort)
 sudo ./install.sh update           # re-pin versions + recreate (backs up first)
 sudo ./install.sh backup           # pg_dump + tar to ./backups
@@ -105,6 +110,41 @@ The `.gitignore` already excludes it.
 
 ---
 
+## Adding storage
+
+```
+sudo ./install.sh storage add      # guided: add an S3-compatible bucket
+sudo ./install.sh storage list     # show configured external mounts
+sudo ./install.sh storage remove   # delete a mount (remote data untouched)
+```
+
+**S3-compatible** (AWS S3, MinIO, Wasabi, Backblaze B2, Ceph, TrueNAS S3, …) is
+supported directly — it's built into Nextcloud core, needs no image changes, and
+is fully reversible. The command prompts for bucket, endpoint, keys, SSL, and
+path-style, then verifies connectivity. You choose whether the mount is available
+to all users or restricted to a user/group.
+
+### NFS or SMB (not a built-in command — here's why, and how)
+
+These are deliberately **not** in the `storage` command:
+
+- **NFS** appears in Nextcloud as a **Local** external storage, but the
+  container can only see a path that's bind-mounted into it. So the host mounts
+  the NFS export, you bind-mount that into the `nextcloud` container, then add it
+  as a Local mount. Runbook:
+  1. On the host: `mount -t nfs server:/export /mnt/nas` (and add to `/etc/fstab`).
+  2. Add a bind mount to the `nextcloud` service in `compose.yaml`:
+     `- /mnt/nas:/mnt/external/nas` — then `docker compose up -d nextcloud`.
+  3. Register it:
+     `occ files_external:create "NAS" local null::null -c datadir=/mnt/external/nas`
+     (run via the same `sudo bash -c 'set -a; source versions.env; source .env; set +a; docker compose exec -T --user www-data nextcloud php occ …'` wrapper).
+  4. `chown -R 33:33` (www-data) on the export, or align NFS ID-mapping.
+- **SMB** needs `smbclient`/`libsmbclient` compiled into the image (the stock
+  `nextcloud` image doesn't ship it), i.e. a custom Dockerfile you maintain per
+  release. For a NAS, prefer exposing it over **NFS** or **S3** instead.
+
+---
+
 ## Validation after install
 
 Run `sudo ./install.sh validate` for automated checks. Three things only you can
@@ -122,6 +162,11 @@ verify:
 - **Talk HPB `TALK_PORT` is the TURN port and must be `3478`.** Setting it to a
   signaling-range value makes the bundled TURN (eturnal) collide with the
   signaling server. Signaling is always on container port 8081.
+- **Talk needs both signaling AND TURN registered.** Signaling lets clients find
+  each other; TURN relays the actual audio/video. The installer registers both —
+  if only signaling were registered, calls would connect but have no media for
+  anyone off-LAN (ICE fails). The **TURN secret is separate** from the signaling
+  secret (`TURN_SECRET` vs `SIGNALING_SECRET`); each must match its container.
 - **Traefik filters unhealthy containers** — a service whose healthcheck is
   failing gets no route (404). Fix the health cause, not the routing.
 - **Multi-homed containers need a Traefik network pin** (`traefik.docker.network`)

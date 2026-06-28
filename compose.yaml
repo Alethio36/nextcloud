@@ -45,6 +45,7 @@ services:
       - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
       - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
       - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.caserver=${ACME_CASERVER:-https://acme-v02.api.letsencrypt.org/directory}
       - --log.level=INFO
     environment:
       CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN:-}
