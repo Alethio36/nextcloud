@@ -6,7 +6,7 @@ full-text search, antivirus, and Client Push — wired together and configured b
 one script.
 
 ```bash
-git clone https://github.com/alethio36/nextcloud nextcloud-stack
+git clone <your-repo-url> nextcloud-stack
 cd nextcloud-stack
 sudo ./install.sh install
 ```
